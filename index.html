@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
-<title>PaddleOCR 手机测试</title>
+<title>PaddleOCR 固定识别引擎</title>
 <style>
 *{box-sizing:border-box}
 body{font-family:system-ui,sans-serif;margin:0;padding:14px;background:#f5f6f8;color:#17202a}
@@ -23,35 +23,31 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:11px;max-height:300px;
 </style>
 </head>
 <body>
-
-<h2>PaddleOCR 手机测试（英文）</h2>
+<h2>PaddleOCR 手机识别引擎</h2>
 
 <div class="note">
-首次使用需要联网下载 OCR 程序和模型。
-模型约 13 MB，另有运行组件。
-照片只在手机浏览器本地处理，不上传 OCR 服务器。
+首次使用需要联网下载 OCR 程序和模型。模型下载后会保存在浏览器本地缓存中。
+照片在手机浏览器本地处理，不上传 OCR 服务器。
+本页面也可作为手机 HTML 的隐藏 OCR 引擎使用。
 </div>
 
 <div class="actions">
 <label class="pick">拍照
 <input id="camera" type="file" accept="image/*" capture="environment">
 </label>
-
 <label class="pick">选择已有图片
 <input id="imageFile" type="file" accept="image/*">
 </label>
-
 <label class="pick">选择 PDF
 <input id="pdfFile" type="file" ="application/pdf,.pdf">
 </label>
-
-<button id="load" class="wide">① 加载英文 OCR 模型</button>
-<button id="run" disabled>② 开始识别</button>
+<button id="load" class="wide" disabled>模型自动加载中…</button>
+<button id="run" disabled>开始识别</button>
 <button id="clear">清除</button>
 </div>
 
 <div class="panel">
-<div id="status" class="status">状态：等待选择图片。</div>
+<div id="status" class="status">正在启动 OCR 引擎…</div>
 <img id="preview" class="preview" hidden>
 </div>
 
@@ -66,17 +62,67 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:11px;max-height:300px;
 </div>
 
 <script type="module">
-
 const $=id=>document.getElementById(id);
 
 const SDK='https://cdn.jsdelivr.net/npm/@paddleocr/paddleocr-js@0.4.2/+esm';
+const DB_NAME='medical-paddleocr-cache';
+const DB_VERSION=1;
+const CACHE_VERSION='ppocrv5-en-2026-01';
 
 let ocr=null;
 let selected=null;
 let objectUrl=null;
+let enginePromise=null;
+let busy=false;
 
 function say(s){
  $('status').textContent=s;
+}
+
+function postToParent(type,data={}){
+ if(window.parent!==window){
+  window.parent.postMessage({type,...data},'*');
+ }
+}
+
+function openCacheDB(){
+ return new Promise((resolve,reject)=>{
+  if(!('indexedDB' in window)){
+   reject(new Error('浏览器不支持 IndexedDB'));
+   return;
+  }
+  const req=indexedDB.open(DB_NAME,DB_VERSION);
+  req.onupgradeneeded=()=>{
+   const db=req.result;
+   if(!db.objectStoreNames.contains('models')){
+    db.createObjectStore('models');
+   }
+  };
+  req.onsuccess=()=>resolve(req.result);
+  req.onerror=()=>reject(req.error||new Error('IndexedDB 打开失败'));
+ });
+}
+
+async function cacheGet(key){
+ const db=await openCacheDB();
+ return new Promise((resolve,reject)=>{
+  const tx=db.transaction('models','readonly');
+  const req=tx.objectStore('models').get(key);
+  req.onsuccess=()=>resolve(req.result||null);
+  req.onerror=()=>reject(req.error);
+  tx.oncomplete=()=>db.close();
+ });
+}
+
+async function cachePut(key,value){
+ const db=await openCacheDB();
+ return new Promise((resolve,reject)=>{
+  const tx=db.transaction('models','readwrite');
+  tx.objectStore('models').put(value,key);
+  tx.oncomplete=()=>{db.close();resolve(true)};
+  tx.onerror=()=>{db.close();reject(tx.error)};
+  tx.onabort=()=>{db.close();reject(tx.error)};
+ });
 }
 
 function pad512(n){
@@ -90,7 +136,6 @@ function tarHeader(name,size){
  function str(s,off,len){
   b.set(enc.encode(s).slice(0,len),off);
  }
-
  function oct(n,off,len){
   str(n.toString(8).padStart(len-1,'0')+'\0',off,len);
  }
@@ -112,13 +157,11 @@ function tarHeader(name,size){
  for(const x of b) sum+=x;
 
  str(sum.toString(8).padStart(6,'0')+'\0 ',148,8);
-
  return b;
 }
 
 function makeTar(entries){
- let parts=[];
-
+ const parts=[];
  for(const e of entries){
   parts.push(
    tarHeader(e.name,e.bytes.length),
@@ -126,58 +169,135 @@ function makeTar(entries){
    new Uint8Array(pad512(e.bytes.length)-e.bytes.length)
   );
  }
-
  parts.push(new Uint8Array(1024));
-
  return new Blob(parts,{type:'application/x-tar'});
 }
 
 async function getBytes(url,label){
- say('正在下载 '+label+' …');
-
+ say('正在下载 '+label+'…');
  const r=await fetch(url,{mode:'cors',cache:'force-cache'});
-
- if(!r.ok){
-  throw new Error(label+' 下载失败：HTTP '+r.status);
- }
-
+ if(!r.ok) throw new Error(label+' 下载失败：HTTP '+r.status);
  return new Uint8Array(await r.arrayBuffer());
 }
 
-async function buildModel(repo,modelName,label){
+async function buildModel(repo,modelName,label,cacheKey){
+ // 优先读取 IndexedDB 中保存的模型压缩包
+ try{
+  const cached=await cacheGet(cacheKey);
+  if(cached instanceof Blob && cached.size>0){
+   say(label+'：使用本地模型缓存…');
+   return cached;
+  }
+ }catch(e){
+  console.warn('读取模型缓存失败，将尝试网络下载：',e);
+ }
 
  const base='https://huggingface.co/'+repo+'/resolve/main/';
-
  const [onnx,yml]=await Promise.all([
   getBytes(base+'inference.onnx',label+' ONNX'),
   getBytes(base+'inference.yml',label+' 配置')
  ]);
 
  const yaml=new TextDecoder().decode(yml);
-
  if(!yaml.includes('model_name: '+modelName)){
   throw new Error(label+' 配置中的模型名称不匹配：'+modelName);
  }
 
- return makeTar([
+ const tar=makeTar([
   {name:'inference.onnx',bytes:onnx},
   {name:'inference.yml',bytes:yml}
  ]);
+
+ // 保存模型 TAR 包，以后打开页面优先使用本地副本
+ try{
+  await cachePut(cacheKey,tar);
+  say(label+' 已下载并保存到本地缓存。');
+ }catch(e){
+  console.warn('模型无法写入 IndexedDB，继续使用浏览器缓存：',e);
+ }
+
+ return tar;
+}
+
+async function initEngine(){
+ if(ocr)return ocr;
+ if(enginePromise)return enginePromise;
+
+ enginePromise=(async()=>{
+  try{
+   say('正在加载 PaddleOCR 程序…');
+   const {PaddleOCR}=await import(SDK);
+
+   say('正在检查本地模型缓存…');
+
+   const [detTar,recTar]=await Promise.all([
+    buildModel(
+     'PaddlePaddle/PP-OCRv5_mobile_det_onnx',
+     'PP-OCRv5_mobile_det',
+     '文字检测模型',
+     CACHE_VERSION+'-det'
+    ),
+    buildModel(
+     'PaddlePaddle/en_PP-OCRv5_mobile_rec_onnx',
+     'en_PP-OCRv5_mobile_rec',
+     '英文识别模型',
+     CACHE_VERSION+'-rec'
+    )
+   ]);
+
+   const detUrl=URL.createObjectURL(detTar);
+   const recUrl=URL.createObjectURL(recTar);
+
+   say('模型准备完成，正在初始化本地 OCR 引擎…');
+
+   ocr=await PaddleOCR.create({
+    textDetectionModelName:'PP-OCRv5_mobile_det',
+    textDetectionModelAsset:{url:detUrl},
+    textRecognitionModelName:'en_PP-OCRv5_mobile_rec',
+    textRecognitionModelAsset:{url:recUrl},
+    ortOptions:{
+     backend:'wasm',
+     numThreads:2,
+     simd:true
+    }
+   });
+
+   $('load').textContent='模型已就绪';
+   $('load').disabled=true;
+   $('run').disabled=!selected;
+
+   say('PaddleOCR 已就绪，可以识别。');
+
+   postToParent('OCR_READY',{
+    engine:'PaddleOCR',
+    version:CACHE_VERSION
+   });
+
+   return ocr;
+
+  }catch(err){
+   console.error(err);
+   enginePromise=null;
+   $('load').disabled=false;
+   $('load').textContent='重新加载 OCR 模型';
+   say('模型加载失败：'+(err?.stack||err));
+   postToParent('OCR_ERROR',{message:String(err?.message||err)});
+   throw err;
+  }
+ })();
+
+ return enginePromise;
 }
 
 function choose(file){
-
  if(!file)return;
-
  if(!file.type.startsWith('image/')){
   say('请选择图片文件。');
   return;
  }
 
  selected=file;
-
- if(objectUrl) URL.revokeObjectURL(objectUrl);
-
+ if(objectUrl)URL.revokeObjectURL(objectUrl);
  objectUrl=URL.createObjectURL(file);
 
  $('preview').src=objectUrl;
@@ -192,145 +312,124 @@ $('imageFile').addEventListener('change',e=>choose(e.target.files?.[0]));
 
 $('pdfFile').addEventListener('change',e=>{
  const f=e.target.files?.[0];
-
  if(f){
-  say('已选择 PDF：'+f.name+'。本测试版暂未接入 PDF 页面转换，请先用图片测试 OCR。');
+  say('已选择 PDF：'+f.name+'。本引擎接收图片；PDF 页面请由手机界面先转换为图片。');
  }
 });
 
-$('load').addEventListener('click',async()=>{
+async function recognize(file,requestId=null){
+ if(busy)throw new Error('OCR 正在处理中，请稍候。');
+ if(!ocr)await initEngine();
 
- if(ocr){
-  say('OCR 模型已经加载。');
-  return;
- }
-
- const btn=$('load');
- btn.disabled=true;
-
+ busy=true;
  try{
-
-  say('正在加载 PaddleOCR.js 程序…');
-
-  const {PaddleOCR}=await import(SDK);
-
-  say('正在从 PaddlePaddle 官方模型库获取模型…');
-
-  const [detTar,recTar]=await Promise.all([
-
-   buildModel(
-    'PaddlePaddle/PP-OCRv5_mobile_det_onnx',
-    'PP-OCRv5_mobile_det',
-    '文字检测模型'
-   ),
-
-   buildModel(
-    'PaddlePaddle/en_PP-OCRv5_mobile_rec_onnx',
-    'en_PP-OCRv5_mobile_rec',
-    '英文识别模型'
-   )
-
-  ]);
-
-  const detUrl=URL.createObjectURL(detTar);
-  const recUrl=URL.createObjectURL(recTar);
-
-  say('模型下载完成，正在初始化手机本地 OCR 引擎…');
-
-  ocr=await PaddleOCR.create({
-
-   textDetectionModelName:'PP-OCRv5_mobile_det',
-
-   textDetectionModelAsset:{
-    url:detUrl
-   },
-
-   textRecognitionModelName:'en_PP-OCRv5_mobile_rec',
-
-   textRecognitionModelAsset:{
-    url:recUrl
-   },
-
-   ortOptions:{
-    backend:'wasm',
-    numThreads:2,
-    simd:true
-   }
-
-  });
-
-  $('run').disabled=!selected;
-
-  btn.textContent='模型已加载';
-
-  say('模型加载成功！现在可以开始识别。');
-
- }catch(err){
-
-  console.error(err);
-
-  say('模型加载失败：'+(err?.stack||err));
-
-  btn.disabled=false;
-
- }
-
-});
-
-$('run').addEventListener('click',async()=>{
-
- if(!ocr||!selected)return;
-
- $('run').disabled=true;
- $('output').textContent='正在识别…';
-
- try{
-
-  const [res]=await ocr.predict(selected);
-
+  say('正在识别图片…');
+  const [res]=await ocr.predict(file);
   const items=res?.items||[];
 
-  $('output').textContent=items.map((x,i)=>
+  const output=items.map((x,i)=>
    `${String(i+1).padStart(3,'0')}  [${typeof x.score==='number'?(x.score*100).toFixed(1)+'%':'--'}]  ${x.text||''}`
   ).join('\n')||'没有识别到文字。';
 
-  $('metrics').textContent=res.metrics?
-   `检测框：${res.metrics.detectedBoxes??'-'}；识别数：${res.metrics.recognizedCount??'-'}；总耗时：${res.metrics.totalMs??'-'} ms；运行环境：${res.runtime??'-'}`
+  const metrics=res.metrics?
+   `检测框：${res.metrics.detectedBoxes??'-'}；识别数：${res.metrics.recognizedCount??'-'}；总耗时：${res.metrics.totalMs??'-'} ms`
    :'';
 
+  $('output').textContent=output;
+  $('metrics').textContent=metrics;
   $('raw').textContent=JSON.stringify(res,null,2);
 
+  // 转成普通 JSON，避免把 SDK 内部对象传给手机界面
+  const result=JSON.parse(JSON.stringify(res));
+
+  postToParent('OCR_RESULT',{
+   requestId,
+   result
+  });
+
+  say('识别完成。');
+
+  return result;
  }catch(err){
-
-  $('output').textContent='识别失败：'+(err?.stack||err);
-
+  console.error(err);
+  postToParent('OCR_ERROR',{
+   requestId,
+   message:String(err?.message||err)
+  });
+  throw err;
  }finally{
-
-  $('run').disabled=false;
-
+  busy=false;
+  $('run').disabled=!selected;
  }
+}
 
+$('load').addEventListener('click',()=>initEngine().catch(()=>{}));
+
+$('run').addEventListener('click',async()=>{
+ if(!selected)return;
+ $('run').disabled=true;
+ try{
+  await recognize(selected);
+ }catch(err){
+  $('output').textContent='识别失败：'+(err?.stack||err);
+ }
 });
 
 $('clear').addEventListener('click',()=>{
-
  selected=null;
-
  $('camera').value='';
  $('imageFile').value='';
  $('pdfFile').value='';
-
  $('preview').hidden=true;
  $('output').textContent='尚未识别。';
  $('metrics').textContent='';
  $('raw').textContent='';
-
  $('run').disabled=true;
-
  say('已清除。');
-
 });
 
+// 手机 HTML 通过隐藏 iframe 将图片传给本页面
+window.addEventListener('message',async event=>{
+ // 只接受父页面发来的消息
+ if(event.source!==window.parent)return;
+
+ const msg=event.data;
+ if(!msg||typeof msg!=='object')return;
+
+ if(msg.type==='OCR_PING'){
+  if(ocr){
+   postToParent('OCR_READY',{
+    engine:'PaddleOCR',
+    version:CACHE_VERSION
+   });
+  }
+  return;
+ }
+
+ if(msg.type==='OCR_REQUEST'){
+  const requestId=msg.requestId??null;
+  const file=msg.image;
+
+  if(!(file instanceof Blob)){
+   postToParent('OCR_ERROR',{
+    requestId,
+    message:'没有收到有效的图片 Blob。'
+   });
+   return;
+  }
+
+  try{
+   await recognize(file,requestId);
+  }catch(err){
+   console.error(err);
+  }
+ }
+});
+
+// 页面启动后自动加载模型，不再要求手动点击下载
+initEngine().catch(err=>{
+ console.error('自动加载失败：',err);
+});
 </script>
 </body>
 </html>
